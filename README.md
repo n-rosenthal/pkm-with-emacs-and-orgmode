@@ -4,3 +4,6 @@ Implementation of a small, naive parser for `.org` files. Defines an Abstract Sy
 
 ## `vector-brain`
 Natural Language Processing, Graph Neural Networks and studies for storing, retrieving and generating documents from Org documents.
+
+## `medias`
+Media logging or registering for storing, automatically or not, different kinds of knowledge obtained from various sources.
