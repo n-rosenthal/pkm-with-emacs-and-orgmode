@@ -1,0 +1,1 @@
+from .YouTubeVideoExtractor import extract
