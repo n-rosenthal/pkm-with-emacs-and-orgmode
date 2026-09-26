@@ -1,0 +1,369 @@
+:PROPERTIES:
+:ID:       ea023603-6504-4dda-85a2-065d63e77745
+:END:
+#+title:   Sistema de /Templates/ para /Journalling/ em ~org-mode~
+#+author:  n-rosenthal
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+PROPERTY: header-args :tangle ~/org/roam/project-code/internal/template-system/journalling.el 
+
+Este documento especifica e implementa o sistema de /templates/ para /journalling/ em ~org-mode~. A versão ~1.0.0~ do sistema define uma /template/ para todo documento de diário e outra /template/ para cada entrada no diário.
+
+O sistema é construído sobre [[id:bcc1b830-e800-415e-9896-59f380137e0a][~documents~]]: as /drawers/ do documento e das entradas são objetos ~Drawer~ (escritos por ~drawer-to-string~) e o alinhamento das palavras-chave usa ~string-pad-right~. As implementações se encontram em [[file:~/org/roam/project-code/internal/template-system/journalling.el][template-system/journalling.el]].
+
+#+name:    templates--journalling--header 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+;;; journalling.el --- Journal templates for the template system -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 n-rosenthal
+
+;; Author: nícolas rosenthal <rdalcorso.nicolas@gmail.com>
+;; Version: 1.0.0
+;; Keywords: template system, org-mode knowledge base, journalling
+;; Package-Requires: ((emacs "27.1"))
+
+;; This file is not part of GNU Emacs.
+
+;;; License:
+;; MIT License
+
+;;; Commentary:
+;; Definition of the template functions for org-mode journals: one
+;; template for a journal document (`journal-header') and another one
+;; for each entry of the journal (`journal-entry').
+;;
+;; Depends on `documents.el', which must be in `load-path'.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'subr-x)  ;; string-trim, string-empty-p (Emacs < 28)
+(require 'org-id)  ;; org-id-uuid
+(require 'documents)
+#+end_src
+
+* Utilitários
+As duas /templates/ compartilham alguns utilitários: a configuração do autor padrão, o alinhamento das linhas ~#+keyword:~, a geração de /timestamps/ e a validação de /tags/.
+
+** Configuração
+#+name:    templates--journalling--config 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defgroup journalling nil
+  "Templates for Org journals."
+  :group 'org
+  :prefix "journalling-")
+
+(defcustom journalling-default-author "n-rosenthal"
+  "Default author written to the `#+author:' keyword of a journal."
+  :type 'string
+  :group 'journalling)
+
+(defcustom journalling-default-document-doctype "journal"
+  "Default DOCTYPE property for journal documents."
+  :type  'string
+  :group 'journalling)
+
+(defcustom journalling-default-entry-doctype "journal-entry"
+  "Default DOCTYPE property for journal entries."
+  :type  'string
+  :group 'journalling)
+
+(defconst templates--journal-keyword-width 11
+  "Width of an Org keyword line up to the start of its value.
+It is the width of `#+version: ', the longest keyword of a header.")
+#+end_src
+
+** Palavras-chave
+Uma linha ~#+key: value~ com o valor alinhado, como nos demais documentos. O nome da palavra-chave é dado /sem/ o prefixo ~#+~ e sem os dois-pontos.
+
+#+name:    templates--journalling--keyword 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defun templates--journal-keyword (key value)
+  "Return the Org keyword line `#+KEY: VALUE', with an aligned value.
+Both KEY and VALUE must be strings."
+  ;; type check validation
+  (unless (stringp key)
+    (signal 'wrong-type-argument (list 'stringp key)))
+  (unless (stringp value)
+    (signal 'wrong-type-argument (list 'stringp value)))
+
+  ;; returns the formatted string "#+KEY:   VALUE"
+  (let ((aligned-key (string-pad-right
+                      (format "#+%s:" key)
+                      (1- templates--journal-keyword-width))))
+    (format "%s %s" aligned-key value)))
+#+end_src
+
+** /Timestamps/
+O cabeçalho usa uma data /ativa/ (~<2026-09-23>~), como no ~#+date:~ dos documentos; a entrada usa um /timestamp/ /inativo/ com hora (~[2026-09-23 Wed 14:32]~). O nome do dia é sempre gerado com o /locale/ ~C~, para que o resultado não dependa da configuração do sistema.
+
+#+name:    templates--journalling--timestamps 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defun templates--journal-date-stamp (&optional time)
+  "Return the active Org date stamp <YYYY-MM-DD> for TIME.
+TIME defaults to the current time."
+  (format-time-string "<%Y-%m-%d>" time))
+
+(defun templates--journal-timestamp (&optional time)
+  "Return the inactive Org timestamp [YYYY-MM-DD Day HH:MM] for TIME.
+TIME defaults to the current time.  The day name does not depend on
+the locale."
+  (let ((system-time-locale "C"))
+    (format-time-string "[%Y-%m-%d %a %H:%M]" time)))
+#+end_src
+
+** /Tags/
+As /tags/ de um /heading/ formam a /string/ ~:a:b:~. Uma /tag/ só pode conter letras, dígitos e ~_~, ~@~, ~#~ e ~%~; qualquer outra coisa quebraria o /heading/, então é rejeitada.
+
+#+name:    templates--journalling--tags 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defun templates--journal-tags (tags)
+  "Return the Org tag string (:tag1:tag2:) for the list TAGS.
+Return the empty string when TAGS is nil.  Signal an error if a tag
+is not a valid Org tag."
+  ;; type check validation
+  (unless (listp tags)
+    (signal 'wrong-type-argument (list 'listp tags)))
+  (dolist (tag tags)
+    (unless (stringp tag)
+      (signal 'wrong-type-argument (list 'stringp tag)))
+    (unless (string-match-p "\\`[[:alnum:]_@#%]+\\'" tag)
+      (error "Invalid Org tag: %S" tag)))
+
+  ;; returns ":tag1:tag2:" or ""
+  (if tags
+      (format ":%s:" (mapconcat #'identity tags ":"))
+    ""))
+#+end_src
+
+* Definição das /Templates/
+** ~JournalHeader~
+A /template/ ~JournalHeader~ define o cabeçalho de todo documento de diário. Ela produz, nesta ordem:
+
+1. a /drawer/ ~PROPERTIES~ do documento, com o ~:ID:~ (um /UUID/ gerado por ~org-id-uuid~) e as propriedades extras que forem pedidas;
+2. as palavras-chave ~#+title:~, ~#+author:~, ~#+date:~ e ~#+doctype:~.
+
+Apenas o título é obrigatório; o resto tem valor padrão.
+
+*** Tipo ~JournalHeader~
+O objeto ~JournalHeader~ é um registro com os campos do cabeçalho. Sua lista de propriedades extras é uma lista de ~key-value-pair~ (ver ~documents~).
+
+#+name:    templates--journalling--JournalHeaderType 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(cl-defstruct (journal-header
+               (:constructor create-journal-header
+                             (title &key
+                                    (id      (org-id-uuid))
+                                    (author  journalling-default-author)
+                                    (date    (templates--journal-date-stamp))
+                                    (doctype journalling-default-document-doctype)
+                                    extra-properties)))
+  "A struct that represents the header of a journal document."
+  (title            nil :type string)
+  (id               nil :type string)
+  (author           nil :type string)
+  (date             nil :type string)
+  (doctype          nil :type string)
+  (extra-properties nil :type list)) ;; list of key-value-pair
+#+end_src
+
+*** ~journal-header~ \to ~string~
+O método abaixo transforma uma /struct/ ~JournalHeader~ em uma /string/. Como ~drawer-to-string~, o resultado /não/ termina em uma quebra de linha.
+
+#+name:    templates--journalling--journalheader2string 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defun journal-header-to-string (header)
+  "Transforms a journal HEADER to an `org-mode' structured string."
+  ;; type check validation
+  (unless (journal-header-p header)
+    (signal 'wrong-type-argument (list 'journal-header-p header)))
+
+  ;; var. definition
+  (let* ((drawer (create-drawer
+                  "properties"
+                  (cons (make-key-value-pair "id" (journal-header-id header))
+                        (journal-header-extra-properties header))))
+         (lines '()))
+
+    ;; (1.) add the PROPERTIES drawer
+    (push (drawer-to-string drawer) lines)
+
+    ;; (2.) add the keywords
+    (dolist (kw (list (cons "title"   (journal-header-title header))
+                      (cons "author"  (journal-header-author header))
+                      (cons "date"    (journal-header-date header))
+                      (cons "doctype" (journal-header-doctype header))))
+      (push (templates--journal-keyword (car kw) (cdr kw)) lines))
+
+    ;; (3.) reverse the lines and join them using `\n'
+    (mapconcat #'identity (nreverse lines) "\n")))
+#+end_src
+
+** ~JournalEntry~
+A /template/ ~JournalEntry~ define cada entrada do diário. Ela produz, nesta ordem:
+
+1. o /heading/, no nível pedido (padrão: 1), com o título e as /tags/ — se a entrada não tem título, o /heading/ é o próprio /timestamp/ de criação;
+2. a /drawer/ ~PROPERTIES~, com ~:ID:~, ~:CREATED:~ (/timestamp/ inativo) e as propriedades extras;
+3. o corpo, separado da /drawer/ por uma linha em branco (omitido se vazio).
+
+Todos os campos são opcionais.
+
+*** Tipo ~JournalEntry~
+#+name:    templates--journalling--JournalEntryType 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(cl-defstruct (journal-entry
+               (:constructor create-journal-entry
+                             (&key
+                              title body tags extra-properties
+                              (level   1)
+                              (id      (org-id-uuid))
+                              (doctype journalling-default-entry-doctype)
+                              (created (templates--journal-timestamp)))))
+  "A struct that represents an entry of a journal document."
+  (title            nil :type (or null string))
+  (body             nil :type (or null string))
+  (tags             nil :type list)   ;; list of string
+  (level            1   :type integer)
+  (id               nil :type string)
+  (doctype          nil :type string)
+  (created          nil :type string)
+  (extra-properties nil :type list))  ;; list of key-value-pair
+#+end_src
+
+*** ~journal-entry~ \to ~string~
+O /heading/ é construído à parte, por ~templates--journal-entry-heading~; ~journal-entry-to-string~ o junta à /drawer/ e ao corpo.
+
+#+name:    templates--journalling--journalentry2string 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defun templates--journal-entry-heading (entry)
+  "Return the Org heading line of the journal ENTRY.
+The heading text is the title of ENTRY or, when it has none, its
+creation timestamp.  The tags of ENTRY, if any, come after the text."
+  (let* ((title (journal-entry-title entry))
+         (text  (if (and title (not (string-empty-p (string-trim title))))
+                    title
+                  (journal-entry-created entry)))
+         (tags  (templates--journal-tags (journal-entry-tags entry))))
+    (concat (make-string (journal-entry-level entry) ?*)
+            " " text
+            (unless (string-empty-p tags)
+              (concat " " tags)))))
+
+(defun journal-entry-to-string (entry)
+  "Transforms a journal ENTRY to an `org-mode' structured string."
+  ;; type check validation
+  (unless (journal-entry-p entry)
+    (signal 'wrong-type-argument (list 'journal-entry-p entry)))
+  (let ((title (journal-entry-title entry))
+        (body  (journal-entry-body entry))
+        (level (journal-entry-level entry)))
+    (unless (or (null title) (stringp title))
+      (signal 'wrong-type-argument (list 'stringp title)))
+    (unless (or (null body) (stringp body))
+      (signal 'wrong-type-argument (list 'stringp body)))
+    (unless (and (integerp level) (> level 0))
+      (error "Journal entry level must be a positive integer: %S" level)))
+
+  ;; var. definition
+  (let* ((drawer (create-drawer
+                  "properties"
+                  (append
+                   (list (make-key-value-pair "id"      (journal-entry-id entry))
+                         (make-key-value-pair "created" (journal-entry-created entry))
+                         (make-key-value-pair "doctype" (journal-entry-doctype entry)))
+                   (journal-entry-extra-properties entry))))
+         (body   (journal-entry-body entry))
+         (lines  '()))
+
+    ;; (1.) add the heading
+    (push (templates--journal-entry-heading entry) lines)
+
+    ;; (2.) add the PROPERTIES drawer
+    (push (drawer-to-string drawer) lines)
+
+    ;; (3.) add the body, after a blank line, unless it is empty
+    (when (and body (not (string-empty-p (string-trim body))))
+      (push "" lines)
+      (push (string-trim-right body) lines))
+
+    ;; (4.) reverse the lines and join them using `\n'
+    (mapconcat #'identity (nreverse lines) "\n")))
+#+end_src
+
+#+RESULTS:
+: journal-entry-to-string
+
+* Exemplos
+Os exemplos abaixo /não/ são exportados para o ~.el~ (~:tangle no~). O ~:id~ e o ~:created~ são fixados para que o resultado seja reproduzível; se omitidos, são gerados na hora.
+
+#+begin_src emacs-lisp :tangle no :results output
+(princ
+ (journal-header-to-string
+  (create-journal-header
+   "Diário de 2026"
+   :id "3f2b8c1e-0a4d-4e7b-9c55-1d2e3f4a5b6c"
+   :date "<2026-09-23>")))
+#+end_src
+
+#+RESULTS:
+#+begin_example
+:PROPERTIES:
+:ID: 3f2b8c1e-0a4d-4e7b-9c55-1d2e3f4a5b6c
+:END:
+#+title:   Diário de 2026
+#+author:  n-rosenthal
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+end_example
+
+#+begin_src emacs-lisp :tangle no :results output
+(princ
+ (journal-entry-to-string
+  (create-journal-entry
+   :title   "Templates de journalling"
+   :body    "Implementei os templates de cabeçalho e de entrada."
+   :tags    '("emacs" "orgmode")
+   :id      "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d"
+   :created "[2026-09-23 Wed 14:32]"
+   :extra-properties (list (make-key-value-pair "mood" "focado")))))
+#+end_src
+
+#+RESULTS:
+#+begin_example
+,* Templates de journalling :emacs:orgmode:
+:PROPERTIES:
+:ID:      9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d
+:CREATED: [2026-09-23 Wed 14:32]
+:MOOD:    focado
+:END:
+
+Implementei os templates de cabeçalho e de entrada.
+#+end_example
+
+* /provider/
+#+name:    templates--journalling--provider 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+
+(provide 'journalling)
+;;; journalling.el ends here
+#+end_src

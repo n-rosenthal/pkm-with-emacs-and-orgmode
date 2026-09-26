@@ -1,0 +1,1532 @@
+:PROPERTIES:
+:ID:       bcc1b830-e800-415e-9896-59f380137e0a
+:END:
+#+title:    Sistema de /Templates/ em ~org-mode~ (base)
+#+author:   n-rosenthal
+#+date:     <2026-09-23>
+#+version:  1.0.0
+#+PROPERTY: header-args :tangle ~/org/roam/project-code/internal/template-system/documents.el 
+
+~documents~ especifica /templates/ utilizadas por todos os documentos ~.org~.
+As implementações se encontram em [[file:~/org/roam/projects-code/internal/template-system/documents.el][template-system/documents.el]].
+
+#+name:    templates--documents--header 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; documents.el --- Org-mode document templates -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 n-rosenthal
+
+;; Author: nícolas rosenthal <rdalcorso.nicolas@gmail.com>
+;; Version: 1.1.0
+;; Keywords: template system, org-mode knowledge base
+;; Package-Requires: ((emacs "27.1"))
+
+;; This file is not part of GNU Emacs.
+
+;;; License:
+;; MIT License
+
+;;; Commentary:
+;;
+;; Structural templates for Org documents.
+;;
+;; The structures defined here intentionally correspond, where applicable,
+;; to `org-element' concepts:
+;;
+;;   keyword
+;;   timestamp
+;;   drawer
+;;   node-property
+;;   property-drawer
+;;   section
+;;   headline
+;;   org-data -> document
+;;
+;; `heading' is NOT an org-element type.  It is a small convenience
+;; abstraction used to construct the properties that form an Org headline.
+;;
+;; The actual parser is deliberately kept outside this file.  These
+;; structures are the representation used by templates and serializers.
+;;
+;;; Code:
+
+(require 'cl-lib)
+(require 'org)
+(require 'org-element)
+#+end_src
+
+#+name:    templates--documents--utils 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Utilities
+;;; --------------------------------------------------------------------------
+
+(defun templates--ensure-string (value name)
+  "Signal an error unless VALUE is a string.
+NAME is used in the error message."
+  (unless (stringp value)
+    (signal 'wrong-type-argument
+            (list 'stringp (list name value))))
+  value)
+
+
+(defun templates--ensure-list (value name)
+  "Signal an error unless VALUE is a list.
+NAME is used in the error message."
+  (unless (listp value)
+    (signal 'wrong-type-argument
+            (list 'listp (list name value))))
+  value)
+
+
+(defun string-pad-right (str total-len)
+  "Pad STR on the right with spaces until it reaches TOTAL-LEN.
+
+If STR is already at least TOTAL-LEN characters long, return it
+unchanged."
+  (templates--ensure-string str 'str)
+
+  (unless (integerp total-len)
+    (signal 'wrong-type-argument
+            (list 'integerp total-len)))
+
+  (when (< total-len 0)
+    (error "TOTAL-LEN must not be negative: %d" total-len))
+
+  (let ((length (length str)))
+    (if (>= length total-len)
+        str
+      (concat str
+              (make-string (- total-len length) ?\s)))))
+
+(defun templates--ensure-nonempty-string (value name)
+  "Signal an error unless VALUE is a non-empty string.
+
+NAME identifies VALUE in the resulting error message."
+  (templates--ensure-string value name)
+  (when (string-empty-p value)
+    (user-error "%s must not be empty" name))
+  value)
+
+(defun templates--join-nonempty (strings separator)
+  "Join non-empty STRINGS using SEPARATOR."
+  (mapconcat #'identity
+             (seq-filter
+              (lambda (string)
+                (and (stringp string)
+                     (not (string-empty-p string))))
+              strings)
+             separator))
+
+(defun templates--to-string (object)
+  "Convert OBJECT to Org syntax.
+
+Strings are treated as plain text.  Org-element AST nodes are
+interpreted with `org-element-interpret-data'.  Template structures
+defined in this file provide their own `*-to-string' functions."
+  (cond
+   ((stringp object)
+    object)
+
+   ((and (listp object)
+         (symbolp (car object))
+         (memq (car object)
+               (append org-element-all-elements
+                       org-element-all-objects
+                       '(org-data))))
+    (org-element-interpret-data object))
+
+   ((fboundp
+     (intern (format "%s-to-string"
+                     (type-of object))))
+    (funcall
+     (intern (format "%s-to-string"
+                     (type-of object)))
+     object))
+
+   (t
+    (user-error "Cannot serialize object: %S" object))))
+#+end_src
+
+* /paragraphs/
+#+name:    templates--documents--paragraphs 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Paragraph (Org element)
+;;; --------------------------------------------------------------------------
+(cl-defstruct
+    (paragraph
+     (:constructor make-paragraph
+                   (&key contents)))
+  "A paragraph element.
+
+Corresponds to the `paragraph' element in `org-element'.
+
+A paragraph contains Org objects and plain text.  In the native
+`org-element' AST, plain text is represented directly as strings."
+  contents)
+
+
+(defun paragraph-to-string (paragraph)
+  "Serialize PARAGRAPH to Org syntax."
+  (templates--join-lines
+   (paragraph-contents paragraph)))
+#+end_src
+
+* /links/
+#+name:    templates--documents--links 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Link
+;;; --------------------------------------------------------------------------
+(cl-defstruct
+    (link
+     (:constructor make-link
+                   (&key type path
+                         raw-link
+                         format
+                         description
+                         search-option
+                         application
+                         explicit-type-p)))
+  "A link object.
+
+Corresponds to the `link' object in `org-element'.
+
+TYPE is the link type, such as \"file\", \"https\", \"id\",
+\"custom-id\" or \"fuzzy\".
+
+PATH is the destination after the explicit link type has been
+removed.
+
+RAW-LINK is the original link target.
+
+FORMAT is one of `plain', `angle' or `bracket'.
+
+DESCRIPTION is the contents of a bracket link.  It is a list
+because links are recursive objects.
+
+SEARCH-OPTION and APPLICATION correspond to the respective
+`org-element' properties.
+
+EXPLICIT-TYPE-P records whether the link explicitly specified
+its type."
+  type
+  path
+  raw-link
+  format
+  description
+  search-option
+  application
+  explicit-type-p)
+
+
+(defun link-to-string (link)
+  "Serialize LINK to Org syntax."
+  (let* ((format (or (link-format link) 'bracket))
+         (raw-link (or (link-raw-link link)
+                       (link-path link)))
+         (description (link-description link)))
+    (pcase format
+      ('plain
+       raw-link)
+
+      ('angle
+       (format "<%s>" raw-link))
+
+      ('bracket
+       (if description
+           (format "[[%s][%s]]"
+                   raw-link
+                   (templates--join-lines description))
+         (format "[[%s]]" raw-link)))
+
+      (_
+       (user-error "Invalid link format: %S" format)))))
+
+
+(defun make-simple-link (path &optional description)
+  "Create a bracket LINK to PATH.
+
+DESCRIPTION, when non-nil, is the link description."
+  (make-link
+   :type nil
+   :path path
+   :raw-link path
+   :format 'bracket
+   :description
+   (when description
+     (if (listp description)
+         description
+       (list description)))))
+#+end_src
+
+* /plain list/
+#+name:    templates--documents--plain-list 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Plain list & Items
+;;; --------------------------------------------------------------------------
+(cl-defstruct
+    (plain-list
+     (:constructor make-plain-list
+                   (&key type items structure)))
+  "A plain list.
+
+Corresponds to the `plain-list' greater element in `org-element'.
+
+TYPE is one of:
+
+  `unordered'
+  `ordered'
+  `descriptive'
+
+ITEMS is a list of `item' structures.
+
+STRUCTURE optionally preserves the result of `org-list-struct'."
+  type
+  items
+  structure)
+
+
+(defun plain-list-type-p (type)
+  "Return non-nil when TYPE is a valid Org plain-list type."
+  (memq type '(unordered ordered descriptive)))
+
+
+(defun plain-list-to-string (list)
+  "Serialize LIST to Org syntax."
+  (unless (plain-list-type-p (plain-list-type list))
+    (user-error "Invalid plain-list type: %S"
+                (plain-list-type list)))
+
+  (mapconcat #'item-to-string
+             (plain-list-items list)
+             "\n"))
+
+;;; Item
+
+(cl-defstruct
+    (item
+     (:constructor make-item
+                   (&key bullet
+                         checkbox
+                         counter
+                         tag
+                         contents
+                         pre-blank
+                         structure)))
+  "An item in a `plain-list'.
+
+Corresponds to the `item' greater element in `org-element'.
+
+BULLET is the actual bullet/counter syntax.
+
+CHECKBOX is one of:
+
+  `on'
+  `off'
+  `trans'
+  nil
+
+TAG is the description-list tag.
+
+CONTENTS contains the elements and objects belonging to the item.
+
+PRE-BLANK and STRUCTURE correspond to the respective
+`org-element' properties."
+  bullet
+  checkbox
+  counter
+  tag
+  contents
+  pre-blank
+  structure)
+
+
+(defun item-checkbox-to-string (checkbox)
+  "Serialize CHECKBOX."
+  (pcase checkbox
+    ('on "[X]")
+    ('off "[-]")
+    ('trans "[-]")
+    (_ nil)))
+
+
+(defun item-tag-to-string (tag)
+  "Serialize TAG.
+
+TAG may be a string or a list of objects."
+  (cond
+   ((null tag)
+    nil)
+   ((stringp tag)
+    tag)
+   ((listp tag)
+    (templates--join-lines tag))
+   (t
+    (user-error "Invalid item tag: %S" tag))))
+
+
+(defun item-to-string (item)
+  "Serialize ITEM to Org syntax."
+  (let* ((bullet (or (item-bullet item) "-"))
+         (checkbox (item-checkbox-to-string
+                    (item-checkbox item)))
+         (tag (item-tag-to-string
+               (item-tag item)))
+         (contents (item-contents item))
+         (prefix
+          (concat bullet
+                  (when checkbox
+                    (concat " " checkbox))
+                  (when tag
+                    (concat " " tag
+                            " ::")))))
+    (if contents
+        (concat
+         prefix
+         " "
+         (templates--join-lines contents))
+      prefix)))
+#+end_src
+
+* /table/
+#+name:    templates--documents--table 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Table
+;;; --------------------------------------------------------------------------
+(cl-defstruct
+    (table
+     (:constructor make-table
+                   (&key type rows tblfm value)))
+  "A table.
+
+Corresponds to the `table' greater element in `org-element'.
+
+TYPE is normally `org' or `table.el'.
+
+ROWS contains `table-row' structures.
+
+TBLFM contains the optional table formula string.
+
+VALUE is used by `table.el' tables."
+  type
+  rows
+  tblfm
+  value)
+
+
+(defun table-type-p (type)
+  "Return non-nil when TYPE is a valid Org table type."
+  (memq type '(org table.el)))
+
+
+(defun table-to-string (table)
+  "Serialize TABLE to Org syntax."
+  (unless (table-type-p (table-type table))
+    (user-error "Invalid table type: %S"
+                (table-type table)))
+
+  (let ((body
+         (mapconcat #'table-row-to-string
+                    (table-rows table)
+                    "\n")))
+    (if (and (eq (table-type table) 'org)
+             (table-tblfm table))
+        (concat body
+                "\n#+TBLFM: "
+                (table-tblfm table))
+      body)))
+
+;;; Table row
+
+(cl-defstruct
+    (table-row
+     (:constructor make-table-row
+                   (&key type cells)))
+  "A row of an Org table.
+
+Corresponds to the `table-row' element in `org-element'.
+
+TYPE is either `standard' or `rule'.
+
+CELLS contains `table-cell' objects."
+  type
+  cells)
+
+
+(defun table-row-type-p (type)
+  "Return non-nil when TYPE is a valid table-row type."
+  (memq type '(standard rule)))
+
+
+(defun table-row-to-string (row)
+  "Serialize ROW to Org syntax."
+  (unless (table-row-type-p (table-row-type row))
+    (user-error "Invalid table-row type: %S"
+                (table-row-type row)))
+
+  (if (eq (table-row-type row) 'rule)
+      "|-"
+    (concat
+     "|"
+     (mapconcat #'table-cell-to-string
+                (table-row-cells row)
+                "|")
+     "|")))
+
+;;; Table cell
+
+(cl-defstruct
+    (table-cell
+     (:constructor make-table-cell
+                   (&key contents)))
+  "A table-cell object.
+
+Corresponds to the `table-cell' recursive object in
+`org-element'.
+
+CONTENTS contains the objects inside the cell."
+  contents)
+
+
+(defun table-cell-to-string (cell)
+  "Serialize CELL to Org syntax."
+  (templates--join-lines
+   (table-cell-contents cell)))
+
+
+(defun make-simple-table-cell (value)
+  "Create a table cell containing VALUE."
+  (make-table-cell
+   :contents
+   (list (if (stringp value)
+             value
+           (format "%s" value)))))
+#+end_src
+
+* /source block/
+#+name:    templates--documents--source-block 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Source block
+;;; --------------------------------------------------------------------------
+(cl-defstruct
+    (src-block
+     (:constructor make-src-block
+                   (&key language
+                         switches
+                         parameters
+                         value
+                         number-lines
+                         preserve-indent
+                         retain-labels
+                         use-labels
+                         label-fmt)))
+  "A source block.
+
+Corresponds to the `src-block' element in `org-element'.
+
+LANGUAGE is the source language.
+
+SWITCHES contains source block switches.
+
+PARAMETERS contains Babel header arguments.
+
+VALUE is the source code itself.
+
+The remaining fields correspond to source-block properties used
+by `org-element'."
+  language
+  switches
+  parameters
+  value
+  number-lines
+  preserve-indent
+  retain-labels
+  use-labels
+  label-fmt)
+
+
+(defun src-block-to-string (block)
+  "Serialize BLOCK to Org source-block syntax."
+  (let ((language (src-block-language block))
+        (switches (src-block-switches block))
+        (parameters (src-block-parameters block))
+        (value (or (src-block-value block) "")))
+
+    (concat
+     "#+BEGIN_SRC"
+     (when language
+       (concat " " language))
+     (when switches
+       (concat " " switches))
+     (when parameters
+       (concat " " parameters))
+     "\n"
+     value
+     (unless (string-suffix-p "\n" value)
+       "\n")
+     "#+END_SRC")))
+#+end_src
+* /tags/
+#+name:    templates--documents--tags 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Tags
+;;; --------------------------------------------------------------------------
+
+;; Tags are properties of `headline' in org-element; they are not an
+;; independent element type.
+;;
+;; Keep this logic generic because journalling.org should use the same
+;; serializer rather than maintaining a second implementation.
+
+(defun templates--tag-valid-p (tag)
+  "Return non-nil when TAG is valid in the heading tag syntax.
+
+This uses Org's own tag regular expression when available."
+  (and (stringp tag)
+       (not (string-empty-p tag))
+       (string-match-p org-tag-re tag)))
+
+
+(defun templates--tags-to-string (tags)
+  "Serialize TAGS as an Org headline tag string.
+
+Return the empty string for NIL.
+Signal an error for invalid tags."
+  (templates--ensure-list tags 'tags)
+
+  (dolist (tag tags)
+    (templates--ensure-string tag 'tag)
+
+    (unless (templates--tag-valid-p tag)
+      (error "Invalid Org tag: %S" tag)))
+
+  (if tags
+      (format ":%s:"
+              (mapconcat #'identity tags ":"))
+    ""))
+
+
+;; Backwards-compatible name for existing users of documents.el.
+(defun templates--heading-tags (tags)
+  "Compatibility wrapper around `templates--tags-to-string'."
+  (templates--tags-to-string tags))
+
+#+end_src
+
+* /keywords/
+#+name:    templates--documents--keywords
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Keyword
+;;; --------------------------------------------------------------------------
+
+;; `keyword' is a real `org-element' type.
+;;
+;; org-element representation:
+;;
+;;   (keyword (:key "TITLE" :value "..." ...))
+;;
+;; The two semantic fields are therefore KEY and VALUE.
+
+(cl-defstruct (keyword
+               (:constructor create-keyword (key value)))
+  "A KEYWORD represents an Org `keyword' element."
+  (key   nil :type string)
+  (value nil :type string))
+
+
+(defun keyword-to-string (keyword)
+  "Serialize KEYWORD using Org keyword syntax.
+
+The returned string has no trailing newline."
+  (unless (keyword-p keyword)
+    (signal 'wrong-type-argument
+            (list 'keyword-p keyword)))
+
+  (let ((key   (keyword-key keyword))
+        (value (keyword-value keyword)))
+
+    (templates--ensure-string key 'key)
+    (templates--ensure-string value 'value)
+
+    (when (string-match-p "[\n\r]" key)
+      (error "Keyword key must be a single line: %S" key))
+
+    (when (string-match-p "[\n\r]" value)
+      (error "Keyword value must be a single line: %S" value))
+
+    ;; Org keyword names are conventionally represented in upper case by
+    ;; org-element, while Org itself accepts case-insensitive names.
+    (format "#+%s: %s"
+            (upcase key)
+            value)))
+
+#+end_src
+
+* /timestamps/
+#+name:    templates--documents--timestamps 
+#+date:    <2026-09-26>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Timestamp
+;;; --------------------------------------------------------------------------
+
+;; `timestamp' is an Org OBJECT, not an element.
+;;
+;; Its org-element representation has a number of derived properties:
+;;
+;;   :type
+;;   :raw-value
+;;   :year-start
+;;   :month-start
+;;   :day-start
+;;   ...
+;;
+;; We deliberately store only TYPE and RAW-VALUE here.
+;;
+;; This is preferable to the previous START/END representation because
+;; START/END are not the representation used by org-element and would
+;; force this template layer to duplicate Org's timestamp parser.
+;;
+;; TYPE is one of:
+;;
+;;   active
+;;   inactive
+;;   active-range
+;;   inactive-range
+;;   diary
+;;
+;; RAW-VALUE is the complete timestamp syntax, including delimiters.
+
+(defconst templates--timestamp-types
+  '(active inactive active-range inactive-range diary)
+  "Timestamp types recognized by `org-element'.")
+
+
+(cl-defstruct (timestamp
+               (:constructor create-timestamp (type raw-value)))
+  "A TIMESTAMP represents an Org `timestamp' object."
+  (type      nil :type symbol)
+  (raw-value nil :type string))
+
+
+(defun timestamp-type-p (type)
+  "Return non-nil when TYPE is a valid Org timestamp type."
+  (memq type templates--timestamp-types))
+
+
+(defun timestamp-to-string (timestamp)
+  "Serialize TIMESTAMP to its original Org syntax.
+
+RAW-VALUE is preserved rather than reconstructed.  This mirrors
+org-element's `:raw-value' property and avoids losing information
+such as ranges, times, repeaters, warnings or diary syntax."
+  (unless (timestamp-p timestamp)
+    (signal 'wrong-type-argument
+            (list 'timestamp-p timestamp)))
+
+  (let ((type      (timestamp-type timestamp))
+        (raw-value (timestamp-raw-value timestamp)))
+
+    (unless (timestamp-type-p type)
+      (error "Invalid Org timestamp type: %S" type))
+
+    (templates--ensure-string raw-value 'raw-value)
+
+    (when (string-match-p "[\n\r]" raw-value)
+      (error "Timestamp must be a single line: %S" raw-value))
+
+    raw-value))
+
+
+(defun templates--timestamp-type-at-string (value)
+  "Return the `org-element' timestamp type parsed from VALUE.
+
+Signal an error if VALUE is not a valid standalone Org timestamp."
+  (with-temp-buffer
+    (insert value "\n")
+    (goto-char (point-min))
+
+    (let ((element (org-element-context)))
+      (unless (eq (org-element-type element) 'timestamp)
+        (error "Invalid Org timestamp: %S" value))
+      (org-element-property :type element))))
+
+
+(defun create-timestamp-from-string (value)
+  "Create a TIMESTAMP from an Org timestamp string VALUE.
+
+The timestamp type is obtained from `org-element', so this constructor
+does not duplicate Org's timestamp grammar."
+  (templates--ensure-string value 'value)
+
+  (let ((type (templates--timestamp-type-at-string value)))
+    (create-timestamp type value)))
+#+end_src
+
+* /headings/
+Em ~org-mode~, definimos secções de um documento através de /headings/. As /headings/ são prefixadas por asteriscos ~*~, seguidas de algumas palavras-chave (e.g. TODO /keywords/), por um *título* e por uma *lista de /tags/.*
+
+#+name:    templates--documents--HeadingType 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Heading
+;;; --------------------------------------------------------------------------
+
+;; IMPORTANT:
+;;
+;; `heading' is NOT an `org-element' type.
+;;
+;; An actual `headline' stores these concepts as properties such as:
+;;
+;;   :level
+;;   :todo-keyword
+;;   :raw-value
+;;   :title
+;;   :tags
+;;
+;; We retain this abstraction because it is useful for constructing a
+;; headline, but it must not be confused with an AST node.
+
+(cl-defstruct (heading
+               (:constructor create-heading (level keyword title tags)))
+  "A template abstraction for the properties of an Org headline."
+  (level   1    :type integer)
+  (keyword nil  :type (or null string))
+  (title   nil  :type string)
+  (tags    nil  :type list))
+
+
+(defun level-to-stars (level)
+  "Return LEVEL asterisks.
+
+LEVEL must be a positive integer."
+  (unless (integerp level)
+    (signal 'wrong-type-argument
+            (list 'integerp level)))
+
+  (when (< level 1)
+    (error "Org headline level must be at least 1: %d" level))
+
+  (make-string level ?*))
+#+end_src
+
+** ~heading~ \to ~string~
+O método abaixo transforma uma /struct/ ~Heading~ em uma /string/ com o formato ~*** KEYWORD título :tag1:tag2:~, em que a /keyword/ e as /tags/ são opcionais. Como ~drawer-to-string~, o resultado /não/ termina em uma quebra de linha.
+
+O título não pode ser vazio: o Org não reconhece ~* TODO~ sem título como uma /keyword/ (lê ~TODO~ como o título) e ~*~ sozinho nem é um /heading/. Pela mesma razão, uma /keyword/ não pode conter espaços.
+
+#+name:    templates--documents--heading2string 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+(defun heading-to-string (heading)
+  "Serialize HEADING as an Org headline line.
+
+This abstraction represents the following subset of headline syntax:
+
+  STARS [TODO] TITLE [TAGS]
+
+Priority cookies, comments and other headline features are deliberately
+not represented by this structure yet."
+  (unless (heading-p heading)
+    (signal 'wrong-type-argument
+            (list 'heading-p heading)))
+
+  (let ((level   (heading-level heading))
+        (keyword (heading-keyword heading))
+        (title   (heading-title heading))
+        (tags    (heading-tags heading)))
+
+    (unless (stringp title)
+      (signal 'wrong-type-argument
+              (list 'stringp title)))
+
+    (when (string-match-p "\\`[[:space:]]*\\'" title)
+      (error "Headline title must not be empty"))
+
+    (when (string-match-p "[\n\r]" title)
+      (error "Headline title must be a single line: %S" title))
+
+    (when (and keyword
+               (or (not (stringp keyword))
+                   (string-empty-p keyword)
+                   (string-match-p "[[:space:]]" keyword)))
+      (error "Invalid TODO keyword: %S" keyword))
+
+    (let ((stars (level-to-stars level))
+          (tag-string (templates--tags-to-string tags)))
+      (concat
+       stars
+       " "
+       (when keyword
+         (concat keyword " "))
+       title
+       (when (not (string-empty-p tag-string))
+         (concat " " tag-string))))))
+#+end_src
+
+* /node property/
+#+name:    templates--documents--node-property
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Node Property
+;;; --------------------------------------------------------------------------
+
+;; `node-property' is a distinct `org-element' type.
+;;
+;; It must not be represented merely as a generic key-value pair if the
+;; goal is to model the Org AST accurately.
+
+(cl-defstruct (node-property
+               (:constructor create-node-property (key value)))
+  "A NODE-PROPERTY represents an Org `node-property' element."
+  (key   nil :type string)
+  (value nil :type string))
+
+
+(defun templates--node-property-key-valid-p (key)
+  "Return non-nil when KEY is a valid Org node-property name."
+  (and (stringp key)
+       (not (string-empty-p key))
+       (not (string-match-p "[\n\r:]" key))))
+
+
+(defun node-property-to-string (node-property)
+  "Serialize NODE-PROPERTY as an Org property line."
+  (unless (node-property-p node-property)
+    (signal 'wrong-type-argument
+            (list 'node-property-p node-property)))
+
+  (let ((key   (node-property-key node-property))
+        (value (node-property-value node-property)))
+
+    (templates--ensure-string key 'key)
+    (templates--ensure-string value 'value)
+
+    (unless (templates--node-property-key-valid-p key)
+      (error "Invalid Org node-property key: %S" key))
+
+    (when (string-match-p "[\n\r]" value)
+      (error "Node-property value must be a single line: %S" value))
+
+    (format ":%s: %s"
+            (upcase key)
+            value)))
+#+end_src
+
+* /drawers/
+** /generic drawers/
+#+name:    templates--documents--generic-drawers
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Generic Drawer
+;;; --------------------------------------------------------------------------
+
+;; `drawer' is a real greater element.
+;;
+;; Its semantic property in org-element is :drawer-name.  The contents are
+;; themselves elements.  The old representation as a list of arbitrary
+;; key/value pairs was therefore too restrictive for a generic drawer.
+;;
+;; We keep PROPERTIES as a compatibility-oriented convenience only for now,
+;; but validate that it contains node-property objects.  A generic drawer
+;; serializer can still emit arbitrary textual contents through CONTENTS.
+
+(cl-defstruct (drawer
+               (:constructor create-drawer (name contents)))
+  "A DRAWER represents a generic Org `drawer' greater element."
+  (name     nil :type string)
+  (contents nil :type list))
+
+
+(defun templates--drawer-header (name)
+  "Return the opening line for drawer NAME."
+  (templates--ensure-string name 'name)
+
+  (when (or (string-empty-p name)
+            (string-match-p "[\n\r:]" name))
+    (error "Invalid Org drawer name: %S" name))
+
+  (format ":%s:" (upcase name)))
+
+
+(defun templates--drawer-end ()
+  "Return the structural closing line of an Org drawer."
+  ":END:")
+
+
+(defun templates--drawer-content-to-string (content)
+  "Serialize one CONTENT item belonging to a drawer."
+  (cond
+   ((stringp content)
+    (string-trim-right content))
+
+   ((node-property-p content)
+    (node-property-to-string content))
+
+   ((key-value-pair-p content)
+    ;; Compatibility with the old representation.
+    (format ":%s: %s"
+            (upcase (key-value-pair-key content))
+            (key-value-pair-value content)))
+
+   (t
+    (error "Unsupported drawer content: %S" content))))
+
+
+(defun drawer-to-string (drawer)
+  "Serialize DRAWER as an Org drawer."
+  (unless (drawer-p drawer)
+    (signal 'wrong-type-argument
+            (list 'drawer-p drawer)))
+
+  (let ((name     (drawer-name drawer))
+        (contents (drawer-contents drawer)))
+
+    (templates--ensure-string name 'name)
+    (templates--ensure-list contents 'contents)
+
+    (mapconcat
+     #'identity
+     (append
+      (list (templates--drawer-header name))
+      (mapcar #'templates--drawer-content-to-string contents)
+      (list (templates--drawer-end)))
+     "\n")))
+#+end_src
+
+** /property drawers/
+#+name:    templates--documents--property-drawers
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Property Drawer
+;;; --------------------------------------------------------------------------
+
+;; `property-drawer' is distinct from `drawer' in org-element.
+;;
+;; It is a greater element whose contents are `node-property' elements.
+;;
+;; The name is structurally fixed to PROPERTIES.
+
+(cl-defstruct (property-drawer
+               (:constructor create-property-drawer (properties)))
+  "A PROPERTY-DRAWER represents an Org `property-drawer' element."
+  (properties nil :type list))
+
+
+(defun property-drawer-to-string (property-drawer)
+  "Serialize PROPERTY-DRAWER."
+  (unless (property-drawer-p property-drawer)
+    (signal 'wrong-type-argument
+            (list 'property-drawer-p property-drawer)))
+
+  (let ((properties (property-drawer-properties property-drawer)))
+    (templates--ensure-list properties 'properties)
+
+    (dolist (property properties)
+      (unless (node-property-p property)
+        (error
+         "Property drawer can contain only node-property objects: %S"
+         property)))
+
+    (mapconcat
+     #'identity
+     (append
+      (list ":PROPERTIES:")
+      (mapcar #'node-property-to-string properties)
+      (list ":END:"))
+     "\n")))
+
+#+end_src
+* documentos Org: alto nível
+Os registros abaixo tentam incorporar toda a sintaxe Org, alinhados aos tipos que o próprio ~org-element~ usa: um documento é uma lista de /headlines/, e cada /headline/ tem, opcionalmente, uma /section/ — seu conteúdo imediato, antes de qualquer /headline/ filha.
+
+** ~Section~
+Uma /secção/ (~Section~), no sentido do ~org-element~, é *só* o conteúdo imediato sob uma /headline/ — texto, /drawers/, o que vier — sem a própria /heading/ e sem as /headlines/ filhas. É a contrapartida do tipo ~section~ que ~org-element-parse-buffer~ devolve.
+
+#+name:    templates--documents--SectionType 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Section
+;;; --------------------------------------------------------------------------
+
+;; `section' is a GREATER ELEMENT.
+;;
+;; It is NOT just a string.  It contains elements/objects representing
+;; everything in the section before the next headline.
+;;
+;; We therefore store CONTENTS as a list.
+;;
+;; Strings are permitted as raw/plain text because the parser layer has not
+;; yet introduced structs for paragraph, plain-list, table, etc.
+
+(cl-defstruct (section
+               (:constructor create-section (contents)))
+  "A SECTION represents an Org `section' greater element."
+  (contents nil :type list))
+
+
+(defun templates--element-to-string (element)
+  "Serialize one supported template ELEMENT."
+  (cond
+   ((stringp element)
+    element)
+
+   ((keyword-p element)
+    (keyword-to-string element))
+
+   ((timestamp-p element)
+    (timestamp-to-string element))
+
+   ((drawer-p element)
+    (drawer-to-string element))
+
+   ((property-drawer-p element)
+    (property-drawer-to-string element))
+
+   ((node-property-p element)
+    (node-property-to-string element))
+
+   ((heading-p element)
+    (heading-to-string element))
+
+   ((headline-p element)
+    (headline-to-string element))
+
+   ((section-p element)
+    (section-to-string element))
+
+   ((document-p element)
+    (document-to-string element))
+
+   ;; Permit an actual org-element AST node.  This is useful during the
+   ;; transition between the parser and this template representation.
+   ((and (listp element)
+         (symbolp (car element))
+         (memq (car element)
+               (append org-element-all-elements
+                       org-element-all-objects)))
+    (org-element-interpret-data element))
+
+   (t
+    (error "Unsupported Org template element: %S" element))))
+#+end_src
+
+*** ~section~ \to ~string~
+#+name:    templates--documents--section2string 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+(defun section-to-string (section)
+  "Serialize SECTION without adding a trailing newline."
+  (unless (section-p section)
+    (signal 'wrong-type-argument
+            (list 'section-p section)))
+
+  (let ((contents (section-contents section)))
+    (templates--ensure-list contents 'contents)
+
+    (mapconcat #'templates--element-to-string
+               contents
+               "\n")))
+#+end_src
+
+** ~Headline~
+Uma /headline/ completa do documento — /heading/ + /section/ imediata + /headlines/ filhas — é o que o ~org-element~ chama de ~headline~. (Isto era chamado ~Section~ numa versão anterior deste documento; renomeado para bater com o tipo real do ~org-element~, já que ali "section" tem um sentido mais restrito — ver acima.)
+
+#+name:    templates--documents--HeadlineType 
+#+date:    <2026-09-26>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Headline
+;;; --------------------------------------------------------------------------
+
+;; An `org-element' headline is itself the AST node.
+;;
+;; It contains a section and nested headlines as contents:
+;;
+;;   headline
+;;     section
+;;     headline
+;;     headline
+;;
+;; There is no separate `heading' child in org-element.
+;;
+;; The `heading' field here remains a template abstraction for the headline
+;; line itself.
+
+(cl-defstruct (headline
+               (:constructor create-headline (heading section children)))
+  "A HEADLINE represents an Org `headline' greater element."
+  (heading  nil :type heading)
+  (section  nil :type (or null section))
+  (children nil :type list))
+
+
+(defun headline-to-string (headline)
+  "Serialize HEADLINE recursively."
+  (unless (headline-p headline)
+    (signal 'wrong-type-argument
+            (list 'headline-p headline)))
+
+  (let* ((heading  (headline-heading headline))
+         (section  (headline-section headline))
+         (children (headline-children headline))
+         (parent-level (heading-level heading))
+         (parts '()))
+
+    (unless (heading-p heading)
+      (signal 'wrong-type-argument
+              (list 'heading-p heading)))
+
+    (unless (or (null section)
+                (section-p section))
+      (signal 'wrong-type-argument
+              (list 'section-p section)))
+
+    (templates--ensure-list children 'children)
+
+    (push (heading-to-string heading) parts)
+
+    (when section
+      (let ((text (section-to-string section)))
+        (unless (string-empty-p text)
+          (push text parts))))
+
+    (dolist (child children)
+      (unless (headline-p child)
+        (signal 'wrong-type-argument
+                (list 'headline-p child)))
+
+      (let ((child-level
+             (heading-level
+              (headline-heading child))))
+
+        (unless (> child-level parent-level)
+          (error
+           "Child headline level (%d) must be greater than parent level (%d)"
+           child-level
+           parent-level)))
+
+      (push (headline-to-string child) parts))
+
+    (mapconcat #'identity
+               (nreverse parts)
+               "\n\n")))
+#+end_src
+
+*** ~headline~ \to ~string~
+O método abaixo transforma uma /struct/ ~Headline~ em uma /string/, recursivamente: primeiro a /heading/ (via ~heading-to-string~), depois a /section/ imediata — se houver e não for vazia —, depois cada /headline/ filha, nessa ordem, cada bloco separado por uma linha em branco. Como ~heading-to-string~, o resultado /não/ termina em uma quebra de linha.
+
+Uma /headline/ filha só é de fato uma /subheadline/ se seu /heading/ tiver nível maior que o da /headline/ pai — do contrário, o Org a leria como uma /headline/ irmã, e a árvore que ~Headline~ representa não corresponderia ao texto gerado. Por isso, ~headline-to-string~ verifica o nível de cada filha antes de gerar a /string/.
+
+#+name:    templates--documents--headline2string 
+#+date:    <2026-09-26>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+(defun headline-to-string (headline)
+  "Transforms a HEADLINE to an `org-mode' structured string.
+Recursively includes HEADLINE's own heading, its immediate section
+and every child headline, in that order.  Signal an error if a
+child's heading level is not greater than HEADLINE's own heading
+level, since such a child would not actually nest under it once the
+result is parsed."
+  ;; type check validation
+  (unless (headline-p headline)
+    (signal 'wrong-type-argument (list 'headline-p headline)))
+
+  ;; var. definition
+  (let* ((heading  (headline-heading headline))
+         (section  (headline-section headline))
+         (children (headline-children headline))
+         (lines    '()))
+
+    ;; type check validation of the remaining fields
+    (unless (heading-p heading)
+      (signal 'wrong-type-argument (list 'heading-p heading)))
+    (unless (or (null section) (section-p section))
+      (signal 'wrong-type-argument (list 'section-p section)))
+    (unless (listp children)
+      (signal 'wrong-type-argument (list 'listp children)))
+    (dolist (child children)
+      (unless (headline-p child)
+        (signal 'wrong-type-argument (list 'headline-p child)))
+      (unless (> (heading-level (headline-heading child)) (heading-level heading))
+        (error "Child headline level must be greater than its parent's: %S"
+               (heading-level (headline-heading child)))))
+
+    ;; (1.) add the heading
+    (push (heading-to-string heading) lines)
+
+    ;; (2.) add the immediate section, after a blank line, unless empty
+    (when section
+      (let ((s (section-to-string section)))
+        (unless (string-empty-p s)
+          (push "" lines)
+          (push s lines))))
+
+    ;; (3.) add each child headline, after a blank line
+    (dolist (child children)
+      (push "" lines)
+      (push (headline-to-string child) lines))
+
+    ;; (4.) reverse the lines and join them using `\n'
+    (mapconcat #'identity (nreverse lines) "\n")))
+#+end_src
+
+** ~Document~
+Mapeamento do tipo ~org-data~ do ~org-element~.
+
+#+name:    templates--documents--document 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Document / org-data
+;;; --------------------------------------------------------------------------
+
+;; `org-data' is the virtual root of an Org parse tree.
+;;
+;; It has no plist of its own and contains the document's top-level
+;; contents.  At the greater-element level this normally consists of:
+;;
+;;   section
+;;   headline
+;;   headline
+;;   ...
+;;
+;; We call our corresponding template abstraction `document'.
+
+(cl-defstruct (document
+               (:constructor create-document (section headlines)))
+  "A DOCUMENT represents the virtual `org-data' root of an Org buffer."
+  (section   nil :type (or null section))
+  (headlines nil :type list))
+
+
+(defun document-to-string (document)
+  "Serialize DOCUMENT as a complete Org document."
+  (unless (document-p document)
+    (signal 'wrong-type-argument
+            (list 'document-p document)))
+
+  (let ((section   (document-section document))
+        (headlines (document-headlines document))
+        (parts     '()))
+
+    (unless (or (null section)
+                (section-p section))
+      (signal 'wrong-type-argument
+              (list 'section-p section)))
+
+    (templates--ensure-list headlines 'headlines)
+
+    ;; Top-level section comes before top-level headlines.
+    (when section
+      (let ((text (section-to-string section)))
+        (unless (string-empty-p text)
+          (push text parts))))
+
+    (dolist (headline headlines)
+      (unless (headline-p headline)
+        (signal 'wrong-type-argument
+                (list 'headline-p headline)))
+
+      (push (headline-to-string headline) parts))
+
+    (mapconcat #'identity
+               (nreverse parts)
+               "\n\n")))
+
+#+end_
+* Construtores convenientes para /templates/
+#+name:    templates--documents--constructors 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Convenient constructors for templates
+;;; --------------------------------------------------------------------------
+(defun templates--make-paragraph (text)
+  "Create a paragraph containing TEXT."
+  (make-paragraph
+   :contents (list text)))
+
+
+(defun templates--make-unordered-list (&rest items)
+  "Create an unordered plain list from ITEMS."
+  (make-plain-list
+   :type 'unordered
+   :items items))
+
+
+(defun templates--make-ordered-list (&rest items)
+  "Create an ordered plain list from ITEMS."
+  (make-plain-list
+   :type 'ordered
+   :items items))
+
+
+(defun templates--make-description-list (&rest items)
+  "Create a descriptive plain list from ITEMS."
+  (make-plain-list
+   :type 'descriptive
+   :items items))
+
+
+(defun templates--make-table (&rest rows)
+  "Create an Org table from ROWS."
+  (make-table
+   :type 'org
+   :rows rows))
+
+
+(defun templates--make-table-row (&rest cells)
+  "Create a standard table row from CELLS."
+  (make-table-row
+   :type 'standard
+   :cells
+   (mapcar (lambda (cell)
+             (if (table-cell-p cell)
+                 cell
+               (make-simple-table-cell cell)))
+           cells)))
+
+
+(defun templates--make-source-block (language value
+                                             &optional parameters switches)
+  "Create a source block.
+
+LANGUAGE is the language identifier.
+VALUE is the source code.
+PARAMETERS are Babel header arguments.
+SWITCHES are source block switches."
+  (make-src-block
+   :language language
+   :value value
+   :parameters parameters
+   :switches switches))
+#+end_src
+
+* Alguns validadores para objetos anteriores
+#+name:    templates--documents--validators 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Some validators for previous objects
+;;; --------------------------------------------------------------------------
+(defun paragraph-p (object)
+  "Return non-nil when OBJECT is a paragraph structure."
+  (cl-typep object 'paragraph))
+
+
+(defun link-p (object)
+  "Return non-nil when OBJECT is a link structure."
+  (cl-typep object 'link))
+
+
+(defun plain-list-p (object)
+  "Return non-nil when OBJECT is a plain-list structure."
+  (cl-typep object 'plain-list))
+
+
+(defun item-p (object)
+  "Return non-nil when OBJECT is an item structure."
+  (cl-typep object 'item))
+
+
+(defun table-p (object)
+  "Return non-nil when OBJECT is a table structure."
+  (cl-typep object 'table))
+
+
+(defun table-row-p (object)
+  "Return non-nil when OBJECT is a table-row structure."
+  (cl-typep object 'table-row))
+
+
+(defun table-cell-p (object)
+  "Return non-nil when OBJECT is a table-cell structure."
+  (cl-typep object 'table-cell))
+
+
+(defun src-block-p (object)
+  "Return non-nil when OBJECT is a source block structure."
+  (cl-typep object 'src-block))
+#+end_src
+* /Helpers/ para conversão utilizando ~org-element~
+#+name:    templates--documents--conversion-helpers 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; --------------------------------------------------------------------------
+;;; Conversion helpers using org-element
+;;; --------------------------------------------------------------------------
+
+(defun document-parse-string (string)
+  "Parse STRING with `org-element' and return its `org-data' tree.
+
+This is intentionally a thin wrapper around Org's parser and is useful
+while the custom extractor layer is being developed."
+  (templates--ensure-string string 'string)
+
+  (with-temp-buffer
+    (insert string)
+    (org-mode)
+    (org-element-parse-buffer)))
+
+
+(defun document-org-element-type (string)
+  "Return the type of the root parsed from STRING.
+
+For a complete buffer this is always `org-data'."
+  (org-element-type
+   (document-parse-string string)))
+#+end_src
+* /provider/
+#+name:    templates--documents--header 
+#+date:    <2026-09-23>
+#+version: 1.0.0
+#+begin_src emacs-lisp
+
+(provide 'documents)
+;;; documents.el ends here
+#+end_src
