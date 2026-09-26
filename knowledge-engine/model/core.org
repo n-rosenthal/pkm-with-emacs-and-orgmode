@@ -1,0 +1,229 @@
+:PROPERTIES:
+:ID:       f3a8a9eb-e073-4d75-b14a-feb9092b3ecb
+:END:
+#+title:    ~org-model-core~: infraestutura comum aos módulos de modelagem
+#+author:   nícolas rosenthal
+#+date:     2026-09-26
+#+version:  1.1.0
+#+PROPERTY: header-args :tangle ~/org/roam/project-code/internal/org/model/core.el
+
+* Módulo ~model/core~
+~model/core.el~ mantém a *estrutura comum* aos módulos de modelagem do projeto. Trata-se de um módulo pequeno e agnóstico em relação aos titpos concretos; aqui está representada a infraestrutura sobre a qual ~document.el~, ~element.el~ e ~object.el~ são construídos. Pertencem ao ~core~ as responsabilidades:
+
+1. /dependências básicas/ ao ~org/model~;
+2. métodos de /validação genérica/;
+3. /operações/ sobre /listas de conteúdos/; e
+4. *serialização* comum;   
+
+#+begin_quote
+org-model
+│
+├── Core
+│   └── infraestrutura
+│
+├── Objects
+│   └── coisas que aparecem dentro de texto
+│
+├── Elements
+│   └── estruturas sintáticas
+│
+└── Documents
+    └── organização hierárquica do documento
+
+                    org-model
+                       │
+              ┌────────┴────────┐
+              │                 │
+          carregamento       modelo
+              │                 │
+              ▼                 ▼
+       org-model.el          core.el
+                                │
+             ┌──────────────────┼─────────────────┐
+             ▼                  ▼                 ▼
+        validação          conteúdo        serialização
+                                                  │
+                                                  ▼
+                                         org-model-to-string   
+#+end_quote
+
+** Propósito
+
+O módulo ~org-model-core~ fornece a infraestrutura comum utilizada pelos demais módulos do modelo de documentos Org.
+
+O core não define elementos ou objetos específicos da sintaxe Org. Ele define operações e abstrações compartilhadas por eles.
+
+** Responsabilidades
+O módulo fornece:
+- validação genérica;
+- operações sobre conteúdos;
+- serialização;
+- utilitários comuns.
+
+Não fazem parte deste módulo:
+- headlines;
+- paragraphs;
+- links;
+- markup;
+- tables;
+- drawers;
+- timestamps.
+
+** Serialização
+O modelo fornece um protocolo comum para a conversão de seus objetos em sintaxe Org.
+
+A função genérica:
+#+begin_example
+(org-model-to-string object)
+#+end_example
+
+deve retornar a representação textual de ~object~.
+
+Cada módulo que introduz um novo tipo concreto é responsável por implementar a serialização desse tipo.
+
+Por exemplo, um objeto definido em ~object.el~ implementará ~org-model-to-string~ para sua própria estrutura. O ~core~ define o protocolo, mas não conhece os tipos concretos que o implementam.
+
+** Conteúdo
+Há uma distinção entre conteúdos /inline/ e elementos estruturais.
+
+*** Objects
+
+Objetos são concatenados sem separador:
+
+#+begin_example
+(org-model--objects-to-string objects)
+#+end_example
+
+*** Elements
+
+Elementos estruturais são serializados preservando sua
+separação estrutural:
+
+#+begin_example
+(org-model--elements-to-string elements)
+#+end_example
+
+** Validação
+O módulo fornece um pequeno conjunto de funções de validação, parametrizadas pelo /predicado/ a checar — o ~core~ não sabe, nem precisa saber, qual predicado cada módulo concreto vai usar; ele só sabe checar "este valor satisfaz este predicado", genericamente.
+
+Checar um valor obrigatório:
+#+begin_example
+(org-model--check-type value predicate)
+#+end_example
+
+Checar um valor opcional (~nil~ é aceito):
+#+begin_example
+(org-model--check-optional-type value predicate)
+#+end_example
+
+Checar que todo elemento de uma lista satisfaz um predicado:
+#+begin_example
+(org-model--check-list-of list predicate)
+#+end_example
+
+As três retornam o próprio valor validado — servem para checar e prosseguir numa única expressão — e sinalizam ~wrong-type-argument~, com o predicado e o valor como dados do erro, quando a checagem falha.
+
+* Implementação
+** /Header/ e dependências
+#+name:    org-model--core--header 
+#+date:    <2026-09-26>
+#+version: 1.0.1
+#+begin_src emacs-lisp
+;;; core.el --- Basic infraestructure for the `org/model' module -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 n-rosenthal
+
+;; Author: nícolas rosenthal <rdalcorso.nicolas@gmail.com>
+;; Version: 1.1.0
+;; Keywords: serialization and infrastructe for Org elements and documents
+;; Package-Requires: ((emacs "27.1"))
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'subr-x)
+
+#+end_src
+
+** Serialização: o protocolo
+~org-model-to-string~ é uma /generic function/ (~cl-defgeneric~): este módulo só declara o protocolo — nenhum método concreto é implementado aqui. Chamá-la sobre um valor para o qual nenhum módulo implementou ~cl-defmethod~ sinaliza ~cl-no-applicable-method~, do próprio ~cl-generic~; não há necessidade de um método padrão neste módulo para isso.
+
+#+name:    org-model--core--protocol 
+#+date:    <2026-09-26>
+#+version: 1.1.0
+#+begin_src emacs-lisp
+(cl-defgeneric org-model-to-string (object)
+  "Return the `org-mode' textual representation of OBJECT.
+This is the shared serialization protocol of `org-model': every
+module that introduces a concrete type is responsible for
+implementing this generic function for its own struct, via
+`cl-defmethod'.  This module declares the protocol only; it
+implements no methods of its own, and calling it on a value with no
+applicable method signals `cl-no-applicable-method'.")
+#+end_src
+
+** Validação genérica
+As três funções abaixo generalizam o padrão de validação repetido em todo módulo concreto (checar um valor obrigatório, um valor opcional, ou cada elemento de uma lista, contra um predicado) numa única implementação, reaproveitada por todos eles.
+
+#+name:    org-model--core--validation 
+#+date:    <2026-09-26>
+#+version: 1.1.0
+#+begin_src emacs-lisp
+(defun org-model--check-type (value predicate)
+  "Signal `wrong-type-argument' unless (PREDICATE VALUE) is non-nil.
+PREDICATE is a function symbol, e.g. `stringp' or `heading-p'; it is
+included, together with VALUE, as the signalled error's data.
+Return VALUE otherwise, so the call can be used inline."
+  (unless (funcall predicate value)
+    (signal 'wrong-type-argument (list predicate value)))
+  value)
+
+(defun org-model--check-optional-type (value predicate)
+  "Signal `wrong-type-argument' unless VALUE is nil or (PREDICATE VALUE).
+Return VALUE otherwise."
+  (when value
+    (org-model--check-type value predicate))
+  value)
+
+(defun org-model--check-list-of (list predicate)
+  "Signal `wrong-type-argument' unless every element of LIST satisfies PREDICATE.
+LIST must itself be a list.  Return LIST otherwise."
+  (org-model--check-type list #'listp)
+  (dolist (item list)
+    (org-model--check-type item predicate))
+  list)
+#+end_src
+
+** Composição de conteúdo
+Os dois /helpers/ abaixo compõem uma lista de valores ~org-model~ heterogêneos — de qualquer tipo concreto, desde que implemente ~org-model-to-string~ — numa única /string/, cada um com a regra de junção própria do que representa: objetos /inline/ não têm separador; elementos estruturais são separados por uma linha em branco.
+
+#+name:    org-model--core--composition 
+#+date:    <2026-09-26>
+#+version: 1.1.0
+#+begin_src emacs-lisp
+(defun org-model--objects-to-string (objects)
+  "Serialize OBJECTS, concatenating them with no separator.
+OBJECTS is a list of `org-model' values; each is converted via
+`org-model-to-string' first.  No separator suits inline content
+sitting directly next to each other."
+  (org-model--check-type objects #'listp)
+  (mapconcat #'org-model-to-string objects ""))
+
+(defun org-model--elements-to-string (elements)
+  "Serialize ELEMENTS, joining them with a blank line between each.
+ELEMENTS is a list of `org-model' values; each is converted via
+`org-model-to-string' first.  A blank line preserves the structural
+separation `org-mode' elements need from one another."
+  (org-model--check-type elements #'listp)
+  (mapconcat #'org-model-to-string elements "\n\n"))
+#+end_src
+
+* /provider/
+#+name:    org-model--core--provider 
+#+date:    <2026-09-26>
+#+version: 1.1.0
+#+begin_src emacs-lisp
+
+(provide 'org-model-core)
+;;; core.el ends here
+#+end_src
